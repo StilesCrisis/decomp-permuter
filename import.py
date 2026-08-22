@@ -254,11 +254,12 @@ def fixup_build_command(
     res: List[str] = []
     skip_count = 0
     assembler = None
-    for part in parts:
+    last_o = len(parts) - 1 - parts[::-1].index("-o")
+    for i, part in enumerate(parts):
         if skip_count > 0:
             skip_count -= 1
             continue
-        if part in ["-MF", "-MT", "-MQ", "-o"]:
+        if part in ["-MF", "-MT", "-MQ"] or i == last_o:
             skip_count = 1
             continue
         if part in ["-M", "-MM", "-MG", "-MP", "-MD", "-MMD", "-Mno-modules"]:
