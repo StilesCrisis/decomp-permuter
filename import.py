@@ -763,6 +763,7 @@ def get_compiler_flags(settings: Mapping[str, object], cmdline: List[str]) -> st
 def write_compile_command(compiler: List[str], cwd: str, out_file: str) -> None:
     with open(out_file, "w", encoding="utf-8") as f:
         f.write("#!/usr/bin/env bash\n")
+        f.write("set -euo pipefail\n")
         f.write('INPUT="$(realpath "$1")"\n')
         f.write('OUTPUT="$(realpath "$3")"\n')
         f.write(f"cd {shlex.quote(cwd)}\n")
