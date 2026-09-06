@@ -5,6 +5,7 @@ import multiprocessing
 from multiprocessing import Queue
 import os
 import queue
+import random
 import re
 import sys
 import threading
@@ -44,6 +45,7 @@ from .permuter import (
     Message,
     NeedMoreWork,
     Permuter,
+    Reseed,
     Task,
     WorkDone,
 )
@@ -85,6 +87,12 @@ class Options:
     debug_mode: bool = False
     speed: int = 100
     ign_branch_targets: bool = False
+    # Opt-in evolutionary/population mode (see the module-level docstring
+    # near run_inner's generation-dispatch code below for the full design).
+    # 0 (default) fully disables it and preserves pre-existing behavior.
+    population_size: int = 0
+    generation_interval: float = 60.0
+    population_fresh_fraction: float = 0.5
 
 
 def restricted_float(lo: float, hi: float) -> Callable[[str], float]:
@@ -103,6 +111,45 @@ def restricted_float(lo: float, hi: float) -> Callable[[str], float]:
     return convert
 
 
+# --- Population/evolutionary mode -------------------------------------
+#
+# Kero-local addition, opt-in via --population-size (0 = off, the default,
+# preserving exact upstream behavior).
+#
+# Background: each permuter worker (one OS process per -j slot) runs ONE
+# CONTINUOUS random walk via --keep-prob: each iteration has `keep_prob`
+# probability of mutating from its own last-accepted candidate rather than
+# resetting to base.c. A single long-running worker can wander into an
+# unproductive corner of the search space and stay stuck there indefinitely
+# -- restarting (fresh OS-entropy seed, back to base.c) was previously the
+# ONLY way to escape a rut, with no way to branch a restart off a good
+# candidate already found instead of either continuing the stuck trajectory
+# or throwing away all progress back to base.c.
+#
+# This adds a population of the top `--population-size` candidates found so
+# far for each permuter (seeded with base.c itself), tracked centrally in
+# the coordinator process (populated in post_score, below, at the same
+# point candidates are written to output-N-M/ -- the ONE place the
+# coordinator already sees every accepted candidate's real score and full
+# source). Every `--generation-interval` seconds (a "generation"), the
+# coordinator directly enqueues one Reseed control message (see
+# permuter.py) per currently-alive worker onto the shared task queue --
+# `--population-fresh-fraction` of them reset a worker to base.c (for
+# diversity), the rest branch it onto a random population member (to
+# compound progress instead of either always getting stuck in one rut or
+# always throwing away everything). Reseed just re-points a worker's own
+# Permuter.reseed_from_source (its _permutations/_cur_cand/_last_score) --
+# base_score/base_hash/hashes, the ground truth used for scoring and dedup,
+# are never touched, so scores stay directly comparable across the whole
+# run regardless of what generation a candidate came from.
+#
+# This only makes sense in the multiprocess/local-worker path (multiple
+# concurrent workers pulling from one shared queue to branch across); it is
+# a no-op with a one-time warning in the single-threaded and pure -J
+# (permuter@home network-only) paths.
+# ------------------------------------------------------------------------
+
+
 @dataclass
 class EvalContext:
     options: Options
@@ -113,6 +160,11 @@ class EvalContext:
     internal_error_stack_traces: Set[str] = field(default_factory=set)
     overall_profiler: Profiler = field(default_factory=Profiler)
     permuters: List[Permuter] = field(default_factory=list)
+    # perm_index -> list of (score, source), sorted ascending by score,
+    # capped at options.population_size. Only populated/consulted when
+    # options.population_size > 0.
+    populations: Dict[int, List[Tuple[int, str]]] = field(default_factory=dict)
+    generations_run: int = 0
 
 
 def write_candidate(
@@ -143,8 +195,28 @@ def write_candidate(
     print(f"wrote to {output_dir}")
 
 
+def _update_population(
+    context: EvalContext, perm_index: int, score: int, source: str
+) -> None:
+    """Record an accepted candidate into its permuter's elite population
+    (see the module docstring above). Deduplicates by exact source text (an
+    --best-only run can otherwise re-report the same tie repeatedly) and
+    keeps only the top `population_size` by score."""
+    cap = context.options.population_size
+    pop = context.populations.setdefault(perm_index, [])
+    if any(s == source for _, s in pop):
+        return
+    pop.append((score, source))
+    pop.sort(key=lambda item: item[0])
+    del pop[cap:]
+
+
 def post_score(
-    context: EvalContext, permuter: Permuter, result: EvalResult, who: Optional[str]
+    context: EvalContext,
+    permuter: Permuter,
+    result: EvalResult,
+    who: Optional[str],
+    perm_index: Optional[int] = None,
 ) -> bool:
     if isinstance(result, EvalError):
         context.internal_errors += 1
@@ -210,6 +282,12 @@ def post_score(
             msg = f"found different asm with same score ({score_value})"
         context.printer.print(msg, permuter, who, color=color)
         write_candidate(permuter, result, context.options.no_context_output)
+        if (
+            context.options.population_size > 0
+            and perm_index is not None
+            and result.source is not None
+        ):
+            _update_population(context, perm_index, score_value, result.source)
     if not context.options.quiet:
         context.printer.progress(status_line)
     return score_value == 0
@@ -257,6 +335,14 @@ def multiprocess_worker(
                 output_queue.put((queue_item, -1, None))
                 output_queue.close()
                 break
+            if isinstance(queue_item, Reseed):
+                # Population-mode control message (see main.py's module
+                # docstring): just re-point this worker's own trajectory and
+                # loop back around for real work. Produces no WorkDone/output
+                # of its own, so it needs no NeedMoreWork bookkeeping beyond
+                # what the top of the loop already does on its next pass.
+                permuters[queue_item.perm_index].reseed_from_source(queue_item.source)
+                continue
             permuter_index, seed = queue_item
             permuter = permuters[permuter_index]
 
@@ -282,6 +368,54 @@ def multiprocess_worker(
         # to KeyboardInterrupt usually result in deadlocks.
         input_queue.cancel_join_thread()
         output_queue.cancel_join_thread()
+
+
+def _maybe_dispatch_generation(
+    context: EvalContext,
+    options: Options,
+    worker_task_queue: "Queue[Task]",
+    active_workers: int,
+    last_generation_time: float,
+) -> float:
+    """If --generation-interval seconds have passed, start a new
+    population-mode generation: enqueue one Reseed control message per
+    currently-alive local worker, split between resetting to base.c (for
+    diversity) and branching onto a random member of that permuter's elite
+    population (to compound progress) per --population-fresh-fraction. A
+    no-op (returns `last_generation_time` unchanged) when population mode is
+    off, there are no local workers, or not enough time has passed yet."""
+    if options.population_size <= 0 or active_workers <= 0:
+        return last_generation_time
+    now = time.time()
+    if now - last_generation_time < options.generation_interval:
+        return last_generation_time
+
+    candidates = [perm_index for perm_index, pop in context.populations.items() if pop]
+    if not candidates:
+        return now
+
+    context.generations_run += 1
+    from_pop = 0
+    from_base = 0
+    for _ in range(active_workers):
+        perm_index = random.choice(candidates)
+        if random.uniform(0, 1) < options.population_fresh_fraction:
+            worker_task_queue.put(Reseed(perm_index, None))
+            from_base += 1
+        else:
+            pop = context.populations[perm_index]
+            _score, source = random.choice(pop)
+            worker_task_queue.put(Reseed(perm_index, source))
+            from_pop += 1
+
+    pop_sizes = {i: len(p) for i, p in context.populations.items()}
+    print(
+        f"\n[generation {context.generations_run}] reseeded {active_workers} "
+        f"worker(s): {from_base} -> base.c, {from_pop} -> population member "
+        f"(population sizes: {pop_sizes})",
+        flush=True,
+    )
+    return now
 
 
 def run(options: Options) -> List[int]:
@@ -403,10 +537,23 @@ def run_inner(options: Options, heartbeat: Callable[[], None]) -> List[int]:
         print("No permuters!")
         return []
 
-    for permuter in context.permuters:
+    for perm_index, permuter in enumerate(context.permuters):
         if name_counts[permuter.fn_name] > 1:
             permuter.unique_name += f" ({permuter.dir})"
         print(f"[{permuter.unique_name}] base score = {permuter.best_score}")
+        if options.population_size > 0:
+            # Seed each permuter's elite population with its own base
+            # candidate, so the very first generation already has something
+            # to (optionally) branch off of.
+            context.populations[perm_index] = [
+                (permuter.best_score, permuter.base_source)
+            ]
+
+    if options.population_size > 0 and (options.threads == 1 and not options.use_network):
+        print(
+            "note: --population-size has no effect in single-threaded mode "
+            "(no other workers to branch across) -- pass -j N to use it."
+        )
 
     if options.debug_mode:
         print("End of Debug Mode... Exiting")
@@ -423,7 +570,7 @@ def run_inner(options: Options, heartbeat: Callable[[], None]) -> List[int]:
             start = time.time()
 
             result = permuter.try_eval_candidate(seed)
-            if post_score(context, permuter, result, None):
+            if post_score(context, permuter, result, None, permuter_index):
                 found_zero = True
                 if options.stop_on_zero:
                     break
@@ -507,7 +654,7 @@ def run_inner(options: Options, heartbeat: Callable[[], None]) -> List[int]:
 
         def process_result(work: WorkDone, who: Optional[str]) -> bool:
             permuter = context.permuters[work.perm_index]
-            return post_score(context, permuter, work.result, who)
+            return post_score(context, permuter, work.result, who, work.perm_index)
 
         def get_task(perm_index: int) -> Optional[Tuple[int, int]]:
             nonlocal next_iterator_index, seed_iterators_remaining
@@ -534,8 +681,12 @@ def run_inner(options: Options, heartbeat: Callable[[], None]) -> List[int]:
         # but workers can ask us to add more tasks into the system if they run
         # out of work. (This will happen e.g. at the very beginning, when the
         # queues are empty.)
+        last_generation_time = time.time()
         while seed_iterators_remaining > 0:
             heartbeat()
+            last_generation_time = _maybe_dispatch_generation(
+                context, options, worker_task_queue, active_workers, last_generation_time
+            )
             feedback, source, who = feedback_queue.get()
             if isinstance(feedback, Finished):
                 process_finish(feedback, source)
@@ -778,8 +929,60 @@ def main() -> None:
         "Not recommended: it increases score volatility in combination "
         "with insertions/deletions.",
     )
+    parser.add_argument(
+        "--population-size",
+        dest="population_size",
+        type=int,
+        default=0,
+        metavar="N",
+        help="""Opt-in evolutionary/population mode: maintain a population of
+            the top N candidates found so far (by score, seeded with base.c)
+            and periodically branch some workers' search onto an elite
+            population member instead of relying purely on each worker's own
+            continuous --keep-prob random walk or a full reset to base.c.
+            0 (default) disables this and preserves exactly today's
+            behavior. Requires multiple local workers (-j > 1); has no
+            effect in single-threaded or pure -J (permuter@home-only) runs.
+            A reasonable starting value is 5-10.""",
+    )
+    parser.add_argument(
+        "--generation-interval",
+        dest="generation_interval",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="""Wall-clock seconds between population-mode 'generations'
+            (reseed dispatches). Only used when --population-size > 0.
+            Default %(default)s.""",
+    )
+    parser.add_argument(
+        "--population-fresh-fraction",
+        dest="population_fresh_fraction",
+        type=restricted_float(0.0, 1.0),
+        default=0.5,
+        metavar="PROB",
+        help="""Fraction of each generation's reseed slots that reset a
+            worker to the original base.c (for diversity) rather than
+            branching it onto a random elite population member (to compound
+            progress). Only used when --population-size > 0. Default
+            %(default)s.""",
+    )
+    parser.add_argument(
+        "--genetic",
+        action="store_true",
+        help="""Shorthand for turning on population/evolutionary mode with
+            a reasonable default (--population-size 8), so you don't have
+            to spell out --population-size yourself. --generation-interval
+            and --population-fresh-fraction keep their own defaults either
+            way - pass them explicitly if you want something other than
+            the defaults. An explicit --population-size (any value,
+            including 0) always takes precedence over this.""",
+    )
 
     args = parser.parse_args()
+
+    if args.genetic and args.population_size <= 0:
+        args.population_size = 8
 
     threads = args.threads
     if not threads and not args.use_network:
@@ -808,6 +1011,9 @@ def main() -> None:
         debug_mode=args.debug_mode,
         speed=args.speed,
         ign_branch_targets=args.ign_branch_targets,
+        population_size=args.population_size,
+        generation_interval=args.generation_interval,
+        population_fresh_fraction=args.population_fresh_fraction,
     )
 
     run(options)

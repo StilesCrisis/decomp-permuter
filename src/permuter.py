@@ -49,6 +49,21 @@ class NeedMoreWork:
     pass
 
 
+@dataclass
+class Reseed:
+    """Control message used by --population-size evolutionary mode (see
+    main.py) to point a permuter's search trajectory at a new starting
+    source, without tearing down and recreating the whole Permuter (which
+    would also reset base_score/base_hash/hashes, the ground truth the
+    scorer needs). `source` is either an elite population candidate's fully
+    materialized C (a prior output-N-M/source.c), or None to mean "reset to
+    the original base.c". Purely a queue-level control message: it carries
+    no seed and produces no WorkDone/output of its own."""
+
+    perm_index: int
+    source: Optional[str]
+
+
 class _CompileFailure(Exception):
     pass
 
@@ -59,7 +74,7 @@ class WorkDone:
     result: EvalResult
 
 
-Task = Union[Finished, Tuple[int, int]]
+Task = Union[Finished, Reseed, Tuple[int, int]]
 FeedbackItem = Union[Finished, Message, NeedMoreWork, WorkDone]
 Feedback = Tuple[FeedbackItem, int, Optional[str]]
 
@@ -158,6 +173,26 @@ class Permuter:
         base_result = base_cand.score(self.scorer, o_file)
         assert base_result.hash is not None
         return base_result.score, base_result.hash, base_cand.get_source()
+
+    def reseed_from_source(self, source: Optional[str]) -> None:
+        """Branch this permuter's working trajectory onto a new source,
+        used by --population-size evolutionary mode to periodically jump a
+        worker onto an elite population candidate (or back to the original
+        base.c, if `source` is None) instead of only ever continuing its own
+        --keep-prob random walk. Only the trajectory moves: base_score/
+        base_hash/base_source/hashes (the ground truth used for scoring and
+        dedup) are untouched, since `source` here has no relation to those
+        other than being a previously-accepted candidate for the same
+        function. Re-parsing is safe even though `source` has no PERM_*
+        macros left in it (they were already resolved when it was first
+        generated) -- perm_parse auto-wraps any macro-free text in a
+        RandomizerPerm (see perm/parse.py), which is exactly what base.c
+        itself goes through, so a population member is just as randomizable
+        as base.c was."""
+        text = source if source is not None else self.base_source
+        self._permutations = perm_parse(text)
+        self._cur_cand = None
+        self._last_score = None
 
     def _need_to_send_source(self, result: CandidateResult) -> bool:
         return self._need_all_sources or self.should_output(result)
